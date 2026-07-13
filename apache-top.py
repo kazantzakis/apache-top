@@ -18,14 +18,28 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ipaddress
+import os
+import queue
+import select
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterator, Literal, Optional
 
 import requests
+
+# Optional POSIX-only terminal modules for interactive key handling.
+# Guarded so the tool still imports on platforms without them (e.g. Windows).
+try:
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:  # pragma: no cover - platform dependent
+    _HAS_TERMIOS = False
 from bs4 import BeautifulSoup
 from rich.align import Align
 from rich.console import Console, Group
@@ -88,6 +102,19 @@ MODE_STYLES: dict[str, str] = {
 SortKey = Literal["cpu", "ss", "req", "acc", "client"]
 SORT_CHOICES: tuple[SortKey, ...] = ("cpu", "ss", "req", "acc", "client")
 
+# Free ip-api.com batch endpoint (HTTP only on the free tier). Returns up to
+# 100 results per request; ~45 requests/min limit. Reference:
+# https://ip-api.com/docs/api:batch
+IPAPI_BATCH_URL = "http://ip-api.com/batch"
+IPAPI_FIELDS = "status,countryCode,country,query"
+IPAPI_MAX_BATCH = 100
+
+# Placeholder display strings for the Country column.
+GEO_PENDING = "\u2026"    # resolution in progress
+GEO_UNKNOWN = "?"          # public IP that could not be resolved
+GEO_PRIVATE = "LAN"        # RFC1918 / unique-local address
+GEO_RESERVED = "\u2014"    # loopback / link-local / reserved / multicast
+
 
 # ---------------------------------------------------------------------------
 # Data contracts (typed dataclasses passed between layers)
@@ -110,6 +137,7 @@ class AppConfig:
     show_all: bool
     sort_key: SortKey
     rows: Optional[int]
+    show_country: bool = False
 
 
 @dataclass
@@ -125,6 +153,9 @@ class AutoStatus:
     bytes_per_sec: float = 0.0
     bytes_per_req: float = 0.0
     cpu_load: float = 0.0
+    load1: Optional[float] = None
+    load5: Optional[float] = None
+    load15: Optional[float] = None
     busy: int = 0
     idle: int = 0
     scoreboard: str = ""
@@ -224,6 +255,8 @@ def parse_args(argv: Optional[list[str]] = None) -> AppConfig:
                         default="ss", help="Sort key for requests (default: ss).")
     parser.add_argument("--rows", type=int, default=None,
                         help="Max request rows to show (default: auto-fit).")
+    parser.add_argument("--country", dest="show_country", action="store_true",
+                        help="Start with the Country column shown (toggle: F2).")
 
     args = parser.parse_args(argv)
 
@@ -246,6 +279,7 @@ def parse_args(argv: Optional[list[str]] = None) -> AppConfig:
         show_all=args.show_all,
         sort_key=args.sort_key,
         rows=args.rows,
+        show_country=args.show_country,
     )
 
 
@@ -299,6 +333,146 @@ class StatusFetcher:
 
 
 # ---------------------------------------------------------------------------
+# Geolocation (IP -> country) via the free ip-api.com batch endpoint
+# ---------------------------------------------------------------------------
+
+
+def classify_ip(ip: str) -> Optional[str]:
+    """Return a local label for non-public addresses, else None.
+
+    Private addresses become 'LAN'; loopback/link-local/reserved/multicast
+    become the reserved dash. Public addresses return None (need a lookup).
+    Unparseable input returns the unknown marker.
+    """
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return GEO_UNKNOWN
+    if addr.is_private and not addr.is_loopback and not addr.is_link_local:
+        return GEO_PRIVATE
+    if (addr.is_loopback or addr.is_link_local or addr.is_reserved
+            or addr.is_multicast or addr.is_unspecified):
+        return GEO_RESERVED
+    return None
+
+
+class GeoResolver:
+    """Resolves client IPs to a 'CODE, Country' string, off the render path.
+
+    Public IPs are resolved by a background worker that batches requests to
+    ip-api.com and caches results. Private/reserved IPs are labelled locally
+    without any network call. Lookups never block or raise into the UI: an
+    unknown public IP returns a pending marker and is queued for resolution.
+    """
+
+    def __init__(self, timeout: float = 5.0, min_interval: float = 1.5) -> None:
+        self._timeout = timeout
+        # Throttle between batch calls to stay well under ~45 req/min.
+        self._min_interval = min_interval
+        self._cache: dict[str, str] = {}
+        self._pending: set[str] = set()
+        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._lock = threading.Lock()
+        self._session = requests.Session()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # -- lifecycle -------------------------------------------------------
+    def start(self) -> None:
+        """Start the background resolver thread (idempotent)."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._worker, name="geo-resolver", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the worker to stop; does not block."""
+        self._stop.set()
+
+    # -- public API ------------------------------------------------------
+    def lookup(self, ip: str) -> str:
+        """Return a display string for ``ip`` (may be a pending marker)."""
+        if not ip:
+            return GEO_RESERVED
+        local = classify_ip(ip)
+        if local is not None:
+            return local
+        with self._lock:
+            if ip in self._cache:
+                return self._cache[ip]
+            if ip not in self._pending:
+                self._pending.add(ip)
+                self._queue.put(ip)
+        return GEO_PENDING
+
+    def resolve_now(self, ips: list[str]) -> None:
+        """Synchronously resolve the given public IPs (used by --once)."""
+        todo = []
+        for ip in ips:
+            if classify_ip(ip) is None:
+                with self._lock:
+                    if ip not in self._cache:
+                        todo.append(ip)
+        for start in range(0, len(todo), IPAPI_MAX_BATCH):
+            self._resolve_batch(todo[start:start + IPAPI_MAX_BATCH])
+
+    # -- internals -------------------------------------------------------
+    def _worker(self) -> None:
+        """Drain the queue in batches, throttled between network calls."""
+        while not self._stop.is_set():
+            batch = self._drain_batch()
+            if not batch:
+                # Nothing to do; wait briefly for new work.
+                time.sleep(0.2)
+                continue
+            self._resolve_batch(batch)
+            # Throttle so bursts of unique IPs stay under the rate limit.
+            self._stop.wait(self._min_interval)
+
+    def _drain_batch(self) -> list[str]:
+        """Collect up to IPAPI_MAX_BATCH queued IPs without blocking long."""
+        batch: list[str] = []
+        try:
+            batch.append(self._queue.get(timeout=0.3))
+        except queue.Empty:
+            return batch
+        while len(batch) < IPAPI_MAX_BATCH:
+            try:
+                batch.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return batch
+
+    def _resolve_batch(self, ips: list[str]) -> None:
+        """Query ip-api for a batch and update the cache."""
+        if not ips:
+            return
+        payload = [{"query": ip, "fields": IPAPI_FIELDS} for ip in ips]
+        results: dict[str, str] = {}
+        try:
+            resp = self._session.post(
+                IPAPI_BATCH_URL, json=payload, timeout=self._timeout)
+            if resp.status_code == 200:
+                for item in resp.json():
+                    ip = item.get("query", "")
+                    if item.get("status") == "success":
+                        code = item.get("countryCode", "")
+                        name = item.get("country", "")
+                        results[ip] = f"{code}, {name}" if code else name or GEO_UNKNOWN
+                    else:
+                        results[ip] = GEO_UNKNOWN
+        except (requests.exceptions.RequestException, ValueError):
+            # Network/JSON failure: mark this batch unknown (retry next launch).
+            results = {ip: GEO_UNKNOWN for ip in ips}
+
+        with self._lock:
+            for ip in ips:
+                self._cache[ip] = results.get(ip, GEO_UNKNOWN)
+                self._pending.discard(ip)
+
+
+# ---------------------------------------------------------------------------
 # Parsers (pure functions - no I/O, easily testable)
 # ---------------------------------------------------------------------------
 
@@ -346,6 +520,10 @@ def parse_auto(text: str) -> AutoStatus:
     status.bytes_per_sec = _to_float(fields.get("BytesPerSec", "0"))
     status.bytes_per_req = _to_float(fields.get("BytesPerReq", "0"))
     status.cpu_load = _to_float(fields.get("CPULoad", "0"))
+    # System load averages (present when mod_status has getloadavg support).
+    status.load1 = _to_float(fields["Load1"]) if "Load1" in fields else None
+    status.load5 = _to_float(fields["Load5"]) if "Load5" in fields else None
+    status.load15 = _to_float(fields["Load15"]) if "Load15" in fields else None
     status.busy = _to_int(fields.get("BusyWorkers", "0"))
     status.idle = _to_int(fields.get("IdleWorkers", "0"))
     status.scoreboard = fields.get("Scoreboard", "")
@@ -571,6 +749,12 @@ def build_summary(auto: AutoStatus, live: LiveMetrics) -> Panel:
     table.add_row("Traffic/sec", live_bps)
     table.add_row("Bytes/request", human_bytes(auto.bytes_per_req))
     table.add_row("CPU Load", f"{auto.cpu_load:.2f} %")
+    # System load averages, when the server reports them.
+    if auto.load1 is not None:
+        loads = [auto.load1, auto.load5, auto.load15]
+        server_load = "  ".join(
+            f"{v:.2f}" if v is not None else "-" for v in loads)
+        table.add_row("Server Load", f"{server_load}  (1/5/15m)")
 
     return Panel(table, title="Summary", border_style="cyan", padding=(0, 1))
 
@@ -611,8 +795,13 @@ def build_workers(auto: AutoStatus, counts: dict[str, int],
 
 
 def build_requests(rows: list[WorkerRow], cfg: AppConfig,
-                   max_rows: Optional[int]) -> Panel:
-    """Bottom panel: sortable, filtered table of active worker connections."""
+                   max_rows: Optional[int],
+                   geo: Optional["GeoResolver"] = None) -> Panel:
+    """Bottom panel: sortable, filtered table of active worker connections.
+
+    When ``cfg.show_country`` is set, a Country column is inserted after
+    Client, resolved via ``geo`` (falling back to a pending marker).
+    """
     visible = rows if cfg.show_all else [
         r for r in rows if r.mode not in ("_", ".", "")
     ]
@@ -630,12 +819,15 @@ def build_requests(rows: list[WorkerRow], cfg: AppConfig,
     table.add_column("Req", justify="right", no_wrap=True)
     table.add_column("Conn", justify="right", no_wrap=True)
     table.add_column("Client", no_wrap=True)
+    if cfg.show_country:
+        table.add_column("Country", no_wrap=True, overflow="ellipsis",
+                         style="magenta")
     table.add_column("VHost", no_wrap=True)
     table.add_column("Request", no_wrap=True, overflow="ellipsis", ratio=1)
 
     for r in visible:
         style = MODE_STYLES.get(r.mode, "white")
-        table.add_row(
+        cells: list[object] = [
             r.srv, r.pid,
             Text(r.mode, style=style),
             f"{r.cpu:.2f}",
@@ -643,11 +835,15 @@ def build_requests(rows: list[WorkerRow], cfg: AppConfig,
             r.req or "-",
             f"{r.conn_kb:.1f}",
             r.client,
-            r.vhost,
-            r.request or "",
-        )
+        ]
+        if cfg.show_country:
+            country = geo.lookup(r.client) if geo is not None else GEO_PENDING
+            cells.append(country)
+        cells.append(r.vhost)
+        cells.append(r.request or "")
+        table.add_row(*cells)
 
-    title = f"Active Requests  ({active_count} active \u00b7 sort: {cfg.sort_key})"
+    title = f"Active Requests  ({active_count} active | sort: {cfg.sort_key})"
     if not visible:
         body: object = Align.center(
             Text("No active requests.", style="dim"), vertical="middle")
@@ -660,11 +856,15 @@ def build_footer(cfg: AppConfig) -> Text:
     """Bottom status line with key hints."""
     footer = Text(justify="center")
     footer.append(f"interval {cfg.interval:g}s", style="dim")
-    footer.append("  \u00b7  ", style="dim")
+    footer.append("  |  ", style="dim")
     footer.append(f"sort {cfg.sort_key}", style="dim")
-    footer.append("  \u00b7  ", style="dim")
+    footer.append("  |  ", style="dim")
     footer.append("--all for idle workers", style="dim")
-    footer.append("  \u00b7  ", style="dim")
+    footer.append("  |  ", style="dim")
+    # Show the F2 country toggle as an on/off shortcut hint.
+    footer.append("F2", style="bold cyan")
+    footer.append(" country on/off", style="dim")
+    footer.append("  |  ", style="dim")
     footer.append("Ctrl-C to quit", style="dim")
     return footer
 
@@ -684,14 +884,15 @@ def build_error(err: FetchError, cfg: AppConfig) -> Panel:
 
 def compose_layout(auto: AutoStatus, rows: list[WorkerRow],
                    live: LiveMetrics, cfg: AppConfig,
-                   console: Console) -> Layout:
+                   console: Console,
+                   geo: Optional["GeoResolver"] = None) -> Layout:
     """Assemble all panels into the full-screen layout grid."""
     now = datetime.now()
     counts = decode_scoreboard(auto.scoreboard)
     extended = detect_extended_status(rows)
 
-    # Reserve vertical space for header(4) + metrics(9) + footer(1) + borders.
-    reserved = 4 + 9 + 1
+    # Reserve vertical space for header(4) + metrics(10) + footer(1) + borders.
+    reserved = 4 + 10 + 1
     if cfg.rows is not None:
         max_rows = cfg.rows
     else:
@@ -700,8 +901,8 @@ def compose_layout(auto: AutoStatus, rows: list[WorkerRow],
     layout = Layout()
     layout.split_column(
         Layout(build_header(auto, cfg, now, extended), name="header", size=4),
-        Layout(name="metrics", size=9),
-        Layout(build_requests(rows, cfg, max_rows), name="requests"),
+        Layout(name="metrics", size=10),
+        Layout(build_requests(rows, cfg, max_rows, geo), name="requests"),
         Layout(build_footer(cfg), name="footer", size=1),
     )
     layout["metrics"].split_row(
@@ -714,6 +915,80 @@ def compose_layout(auto: AutoStatus, rows: list[WorkerRow],
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+
+# Actions produced by keypresses.
+Action = Literal["toggle_country", "quit"]
+
+# Escape sequences emitted by F2 across common terminals (xterm/VT vs others).
+_F2_SEQUENCES: tuple[bytes, ...] = (b"\x1bOQ", b"\x1b[12~")
+
+
+def parse_key(data: bytes) -> Optional[Action]:
+    """Map raw terminal input bytes to a UI action.
+
+    Recognises F2 (and 'c'/'C' as a fallback since terminals or multiplexers
+    often intercept function keys) for the country toggle, plus 'q' to quit.
+    Returns None for anything unrecognised.
+    """
+    if not data:
+        return None
+    if data in _F2_SEQUENCES:
+        return "toggle_country"
+    if data in (b"c", b"C"):
+        return "toggle_country"
+    if data in (b"q", b"Q"):
+        return "quit"
+    return None
+
+
+class KeyReader:
+    """Context manager for non-blocking single-key reads on a POSIX TTY.
+
+    Puts stdin into cbreak mode on enter and restores it on exit. When stdin
+    is not a TTY (or termios is unavailable) it degrades to a no-op so the
+    tool still runs; interactive toggles simply won't be available.
+    """
+
+    def __init__(self) -> None:
+        self._fd: Optional[int] = None
+        self._saved: object = None
+        self.enabled = False
+
+    def __enter__(self) -> "KeyReader":
+        if not _HAS_TERMIOS or not sys.stdin.isatty():
+            return self
+        try:
+            self._fd = sys.stdin.fileno()
+            self._saved = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+            self.enabled = True
+        except (termios.error, ValueError, OSError):
+            self._fd = None
+            self.enabled = False
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._fd is not None and self._saved is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+            except (termios.error, ValueError, OSError):
+                pass
+
+    def poll(self, timeout: float) -> Optional[Action]:
+        """Wait up to ``timeout`` seconds for a key; return its action.
+
+        If interactive input is unavailable this just sleeps for ``timeout``
+        so the caller's refresh cadence is unchanged.
+        """
+        if not self.enabled or self._fd is None:
+            time.sleep(max(0.0, timeout))
+            return None
+        ready, _, _ = select.select([self._fd], [], [], timeout)
+        if not ready:
+            return None
+        # Read the full escape sequence (or single byte) that is available.
+        data = os.read(self._fd, 8)
+        return parse_key(data)
 
 
 def _ticks(cfg: AppConfig) -> Iterator[int]:
@@ -732,8 +1007,13 @@ def run(cfg: AppConfig) -> int:
     console = Console()
     fetcher = StatusFetcher(cfg)
     metrics = MetricsState()
+    geo = GeoResolver(timeout=cfg.timeout)
 
-    def render_once() -> object:
+    # Cache of the most recent fetch so a keypress toggle can re-render
+    # instantly without hitting the network again.
+    last: dict[str, object] = {"auto": None, "rows": [], "live": LiveMetrics()}
+
+    def fetch_and_render() -> object:
         try:
             auto = parse_auto(fetcher.fetch_auto())
         except FetchError as exc:
@@ -744,20 +1024,54 @@ def run(cfg: AppConfig) -> int:
         except FetchError:
             rows = []
         live = metrics.update(auto)
-        return compose_layout(auto, rows, live, cfg, console)
+        last["auto"], last["rows"], last["live"] = auto, rows, live
+        return compose_layout(auto, rows, live, cfg, console, geo)
+
+    def render_cached() -> object:
+        """Re-render from the last fetch (used after a toggle keypress)."""
+        auto = last["auto"]
+        if auto is None:
+            return Align.center(Text("Loading\u2026", style="dim"))
+        return compose_layout(auto, last["rows"], last["live"],  # type: ignore[arg-type]
+                              cfg, console, geo)
 
     if cfg.once:
-        console.print(render_once())
+        if cfg.show_country:
+            # Block briefly so the single snapshot shows resolved countries.
+            try:
+                rows = parse_html_workers(fetcher.fetch_html())
+                geo.resolve_now([r.client for r in rows])
+            except FetchError:
+                pass
+        console.print(fetch_and_render())
         return 0
 
-    with Live(console=console, screen=True, transient=False,
-              auto_refresh=False) as live_view:
-        for tick in _ticks(cfg):
-            live_view.update(render_once(), refresh=True)
-            is_last = (cfg.iterations is not None
-                       and tick >= cfg.iterations - 1)
-            if not is_last:
-                time.sleep(cfg.interval)
+    geo.start()
+    try:
+        with KeyReader() as keys, Live(console=console, screen=True,
+                                       transient=False,
+                                       auto_refresh=False) as live_view:
+            for tick in _ticks(cfg):
+                live_view.update(fetch_and_render(), refresh=True)
+                is_last = (cfg.iterations is not None
+                           and tick >= cfg.iterations - 1)
+                if is_last:
+                    break
+                # Wait out the refresh interval while polling for keypresses so
+                # toggles feel instant instead of waiting a full cycle.
+                deadline = time.monotonic() + cfg.interval
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    action = keys.poll(min(remaining, 0.15))
+                    if action == "quit":
+                        return 0
+                    if action == "toggle_country":
+                        cfg.show_country = not cfg.show_country
+                        live_view.update(render_cached(), refresh=True)
+    finally:
+        geo.stop()
     return 0
 
 
