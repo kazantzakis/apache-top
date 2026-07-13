@@ -12,7 +12,8 @@ dashboard using [`rich`](https://github.com/Textualize/rich).
 ╭─ Summary ─────────────────╮╭─ Workers ────────────────────────────────╮
 │ Total Requests 1,284,553  ││ Busy 18  Idle 32  Total 50               │
 │ Requests/sec   3.4 (5.1)  ││ [██████████░░░░░░░░░░░░░░░░]  36%         │
-│ ...                       ││ Send 11 Read 2 Keep 3 Close 1 ...        │
+│ CPU Load       4.7 %      ││ Send 11 Read 2 Keep 3 Close 1 ...        │
+│ Server Load    0.42 ...   ││ Wait 32 DNS 0  Log 1  Open 206           │
 ╰───────────────────────────╯╰──────────────────────────────────────────╯
 ╭─ Active Requests (18 active · sort: ss) ────────────────────────────────────╮
 │ Srv PID M CPU SS Req Conn Client VHost Request                              │
@@ -68,6 +69,7 @@ expanded to `http://<host>/server-status`.
 ./apache-top.py localhost:8080 -i 1
 ./apache-top.py https://host/server-status --sort cpu
 ./apache-top.py web01 --once
+./apache-top.py web01 --country          # start with the Country column
 ```
 
 ### Options
@@ -84,8 +86,37 @@ expanded to `http://<host>/server-status`.
 | `--all` | Include idle/open worker slots in the table | off |
 | `--sort` | Sort requests by `cpu`,`ss`,`req`,`acc`,`client` | `ss` |
 | `--rows` | Max request rows to show | auto-fit |
+| `--country` | Start with the Country column shown | off |
 
 Press `Ctrl-C` to quit.
+
+### Interactive keys
+
+| Key | Action |
+|-----|--------|
+| `F2` (or `c`) | Toggle the **Country** column on/off |
+| `q` | Quit |
+
+`c` is provided as a fallback because some terminals and multiplexers (tmux,
+screen) intercept `F2`. The current toggle state is shown in the footer hint at
+the bottom of the screen. Interactive keys require a real TTY; when input is
+piped or redirected, use `--country` instead.
+
+## Country lookup (geolocation)
+
+When the Country column is enabled, client IPs are resolved to a
+`CODE, Country` label (e.g. `US, United States`) using the free
+[ip-api.com](https://ip-api.com) service. Lookups run in a background thread and
+are cached, so the dashboard never blocks; a newly seen IP shows `…` until it
+resolves (usually within a refresh or two).
+
+- **Private/reserved IPs** are labelled locally without any network call:
+  `LAN` for RFC1918 addresses, `—` for loopback/link-local/reserved.
+- **Rate limits**: the free tier allows ~45 requests/min. Requests are batched
+  (up to 100 IPs each) and throttled to stay under this.
+- **Privacy**: enabling this column sends the observed **client IP addresses**
+  to ip-api.com over HTTP. Leave the column off (the default) if that is not
+  acceptable for your environment.
 
 ## Scoreboard legend
 
