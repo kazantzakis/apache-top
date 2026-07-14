@@ -114,6 +114,11 @@ GEO_PENDING = "\u2026"    # resolution in progress
 GEO_UNKNOWN = "?"          # public IP that could not be resolved
 GEO_PRIVATE = "LAN"        # RFC1918 / unique-local address
 GEO_RESERVED = "\u2014"    # loopback / link-local / reserved / multicast
+GEO_RATELIMIT = "API Limit"  # ip-api HTTP 429; transient, retried on next cycle
+
+# Markers that represent transient failures: they are shown to the user but
+# re-queued on the next lookup so resolution self-heals without hammering.
+_RETRYABLE = frozenset({GEO_UNKNOWN, GEO_RATELIMIT})
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +405,13 @@ class GeoResolver:
             return local
         with self._lock:
             if ip in self._cache:
-                return self._cache[ip]
+                cached = self._cache[ip]
+                # Transient failures self-heal: re-queue but keep showing the
+                # marker (e.g. 'Rlimit') instead of flickering back to pending.
+                if cached in _RETRYABLE and ip not in self._pending:
+                    self._pending.add(ip)
+                    self._queue.put(ip)
+                return cached
             if ip not in self._pending:
                 self._pending.add(ip)
                 self._queue.put(ip)
@@ -445,7 +456,14 @@ class GeoResolver:
         return batch
 
     def _resolve_batch(self, ips: list[str]) -> None:
-        """Query ip-api for a batch and update the cache."""
+        """Query ip-api for a batch and update the cache.
+
+        On HTTP 429 the whole request is rate-limited, so every IP is marked
+        ``GEO_RATELIMIT``; any other non-200 or network/JSON failure marks the
+        batch ``GEO_UNKNOWN``. Both are retryable markers: they are cached for
+        display but the IP is dropped from ``_pending`` so a later ``lookup``
+        re-queues it, letting resolution self-heal once the limit resets.
+        """
         if not ips:
             return
         payload = [{"query": ip, "fields": IPAPI_FIELDS} for ip in ips]
@@ -462,8 +480,10 @@ class GeoResolver:
                         results[ip] = f"{code}, {name}" if code else name or GEO_UNKNOWN
                     else:
                         results[ip] = GEO_UNKNOWN
+            elif resp.status_code == 429:
+                results = {ip: GEO_RATELIMIT for ip in ips}
         except (requests.exceptions.RequestException, ValueError):
-            # Network/JSON failure: mark this batch unknown (retry next launch).
+            # Network/JSON failure: mark this batch unknown (retried later).
             results = {ip: GEO_UNKNOWN for ip in ips}
 
         with self._lock:
@@ -838,7 +858,10 @@ def build_requests(rows: list[WorkerRow], cfg: AppConfig,
         ]
         if cfg.show_country:
             country = geo.lookup(r.client) if geo is not None else GEO_PENDING
-            cells.append(country)
+            # Highlight the rate-limit marker in red; the column style handles
+            # the rest (magenta), so plain strings inherit it as before.
+            cells.append(Text(country, style="bold red")
+                         if country == GEO_RATELIMIT else country)
         cells.append(r.vhost)
         cells.append(r.request or "")
         table.add_row(*cells)

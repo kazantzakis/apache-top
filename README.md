@@ -113,7 +113,10 @@ resolves (usually within a refresh or two).
 - **Private/reserved IPs** are labelled locally without any network call:
   `LAN` for RFC1918 addresses, `—` for loopback/link-local/reserved.
 - **Rate limits**: the free tier allows ~45 requests/min. Requests are batched
-  (up to 100 IPs each) and throttled to stay under this.
+  (up to 100 IPs each) and throttled to stay under this. If the limit is still
+  hit, affected IPs show `API Limit` (in red) and resolve automatically on a
+  later refresh.
+- **Unresolved** public IPs show `?` and are retried on a later refresh.
 - **Privacy**: enabling this column sends the observed **client IP addresses**
   to ip-api.com over HTTP. Leave the column off (the default) if that is not
   acceptable for your environment.
